@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Katětov–Urysohn + DCL TSP Code
+
+This code implements a Dual-Constraint Lifting system for partial distances
+applied to the Traveling Salesman Problem (TSP). The approach uses expansions
+(triangle and quadrangular) and an iterative solver reminiscent of difference
+constraints.
+
+Author: Elio Michaël Ferrayé
+Date: 03/30/25
+License: Apache License 2.0
+© 2025 Elio Michaël Ferrayé. All rights reserved.
+"""
+
+import math
+import time
+import random
+from collections import defaultdict
+import matplotlib.pyplot as plt
+
+###############################################################################
+# I. DATA STRUCTURES: TSP
+###############################################################################
+
+class TSPInstance:
+    """
+    A container for TSP data and parameters.
+
+    Attributes:
+        n (int): number of cities
+        dist_matrix (list of lists of float): cost matrix dist_matrix[i][j]
+          representing the distance (or cost) from city i to city j
+        K (float): the threshold to test for a Hamiltonian cycle of cost <= K
+        city_coords (list of tuple(float, float) or None): optional coordinates
+          for each city for visualization (e.g., (x, y) pairs). If None, no
+          direct visualization of city positions can be done.
+    """
+    def __init__(self, n, dist_matrix, K, city_coords=None):
+        self.n = n
+        self.dist_matrix = dist_matrix
+        self.K = K
+        self.city_coords = city_coords
+
+###############################################################################
+# II. PARTIAL DIST
+###############################################################################
+
+class PartialDistance:
+    """
+    Stores partial distance constraints in the form:
+        dist_map[frozenset({p, q})] = (low, high)
+
+    where 'low' and 'high' are floats indicating the minimum and maximum
+    allowable distances between points p and q, respectively.
+
+    The set_constraint(...) method merges new constraints with existing ones by
+    taking the maximum of the 'low' values and the minimum of the 'high' values.
+    """
+
+    def __init__(self):
+        self.dist_map = {}
+
+    def _max_none(self, a, b):
+        """
+        Returns the maximum of a and b, where either might be None, signifying
+        no lower bound. If both are None or are effectively negative infinity,
+        returns None.
+        """
+        va = -math.inf if a is None else a
+        vb = -math.inf if b is None else b
+        mx = max(va, vb)
+        return None if mx == -math.inf else mx
+
+    def _min_none(self, a, b):
+        """
+        Returns the minimum of a and b, where either might be None, signifying
+        no upper bound. If both are None or are effectively infinity, returns None.
+        """
+        va = math.inf if a is None else a
+        vb = math.inf if b is None else b
+        mn = min(va, vb)
+        return None if mn == math.inf else mn
+
+    def set_constraint(self, p, q, low, high):
+        """
+        Merges a new constraint [low, high] for the pair (p, q) with the
+        existing constraint, if any.
+        The functional logic remains unaltered from the original version.
+        """
+        if p == q:
+            return
+        key = frozenset({p, q})
+        (old_low, old_high) = self.dist_map.get(key, (None, None))
+        new_low = self._max_none(old_low, low)
+        new_high = self._min_none(old_high, high)
+        self.dist_map[key] = (new_low, new_high)
+
+    def get_constraint(self, p, q):
+        """
+        Retrieves the tuple (low, high) for the pair (p, q).
+        Returns (None, None) if no constraint exists.
+        """
+        return self.dist_map.get(frozenset({p, q}), (None, None))
+
+###############################################################################
+# III. BUILD TSP POINTS
+###############################################################################
+
+def build_points_tsp(tsp: TSPInstance):
+    """
+    Creates the point set X and a label dictionary for TSP:
+    We have 2n city points, labeled city_i_in and city_i_out, plus one pivot.
+    The pivot is named "Pivot_global".
+
+    Returns:
+        X (list of str): all point names
+        label (dict): label[x] => ("city_in", i), ("city_out", i), or ("pivot", None)
+    """
+    X = []
+    label = {}
+    for i in range(tsp.n):
+        pIn = f"city{i}_in"
+        pOut = f"city{i}_out"
+        X.append(pIn)
+        X.append(pOut)
+        label[pIn] = ("city_in", i)
+        label[pOut] = ("city_out", i)
+
+    pivot = "Pivot_global"
+    X.append(pivot)
+    label[pivot] = ("pivot", None)
+
+    return X, label
+
+###############################################################################
+# IV. PARTIAL DIST TSP => more flexible
+###############################################################################
+
+def assign_partial_dist_tsp(tsp: TSPInstance, X, label):
+    """
+    Assigns partial-dist constraints for TSP.
+
+    1) city_in vs city_out for each city => distance <= eps
+    2) city_i_out -> city_j_in => [0, dist_matrix[i][j]]
+    3) pivot -> city_in/out => [0, big]
+
+    This sets up the intervals so that expansions can detect whether
+    a route cost could exceed K. If the expansions see that sum> K,
+    the approach yields unsatisfiability => "NO".
+
+    Returns:
+        pdist (PartialDistance): a PartialDistance object with assigned constraints.
+    """
+    pdist = PartialDistance()
+    city_in = {}
+    city_out = {}
+    pivotName = None
+
+    for x in X:
+        info = label[x]
+        if info[0] == 'city_in':
+            city_in[info[1]] = x
+        elif info[0] == 'city_out':
+            city_out[info[1]] = x
+        else:
+            pivotName = x
+
+    eps = 0.001
+    for i in range(tsp.n):
+        pdist.set_constraint(city_in[i], city_out[i], None, eps)
+
+    for i in range(len(tsp.dist_matrix)):
+        for j in range(len(tsp.dist_matrix[i])):
+            if i != j:
+                c = tsp.dist_matrix[i][j]
+                pdist.set_constraint(city_out[i], city_in[j], 0.0, c)
+
+
+    big = (tsp.K + 500) * (tsp.n + 5)
+    for i in range(tsp.n):
+        pdist.set_constraint(pivotName, city_in[i], 0.0, big)
+        pdist.set_constraint(city_out[i], pivotName, 0.0, big)
+
+    return pdist
+
+###############################################################################
+# V. BUILD DCL => tri + quad
+###############################################################################
+
+def build_DCL_system_tsp(X, pdist: PartialDistance, doTriangle=True, doQuadrangle=True):
+    """
+    Builds the data needed for the difference constraints system:
+    varIndex : mapping from each point x to an integer index
+    constraints2var : a list of 2-var difference constraints, e.g. ('<=', i,j, val)
+    triList : a list of (a,b,c) for triangle expansions
+    quadList : a list of (p,q,r,s) for quadrangular expansions
+    """
+    varIndex = {}
+    for i, x in enumerate(X):
+        varIndex[x] = i
+
+    constraints2var = []
+    n = len(X)
+
+    # Incorporate partial-dist constraints
+    for key, (low, high) in pdist.dist_map.items():
+        if len(key) < 2:
+            continue
+        (p, q) = list(key)
+        i = varIndex[p]
+        j = varIndex[q]
+        if low is not None:
+            constraints2var.append(('>=', i, j, low))
+            constraints2var.append(('>=', j, i, low))
+        if high is not None:
+            constraints2var.append(('<=', i, j, high))
+            constraints2var.append(('<=', j, i, high))
+
+    triList = []
+    quadList = []
+    if doTriangle:
+        for a in range(n):
+            for b in range(a+1, n):
+                for c in range(b+1, n):
+                    triList.append((a, b, c))
+
+    if doQuadrangle:
+        for p in range(n):
+            for q in range(p+1, n):
+                for r in range(q+1, n):
+                    for s in range(r+1, n):
+                        quadList.append((p, q, r, s))
+
+    return (varIndex, constraints2var, triList, quadList)
+
+###############################################################################
+# VI. SOLVE => tri+quad expansions
+###############################################################################
+
+def solve_system(n, constraints2var, triList, quadList):
+    """
+    Applies an iterative difference-constraints approach reminiscent of
+    Floyd–Warshall, plus expansions for triangle and quadrangular constraints.
+
+    Returns:
+      True if stable and no negative cycle is found,
+      False if negative cycle arises => contradiction.
+    """
+    INF = 1e15
+    distM = [[0 if i == j else INF for j in range(n)] for i in range(n)]
+
+    # Insert partial-dist constraints
+    for cst in constraints2var:
+        (typ, i, j, val) = cst
+        if typ == '<=':
+            if val < distM[i][j]:
+                distM[i][j] = val
+        else:
+            alt = -val
+            if alt < distM[j][i]:
+                distM[j][i] = alt
+
+    iteration = 0
+    maxIter = n * n
+    changed = True
+    while changed and iteration < maxIter:
+        changed = False
+        iteration += 1
+
+        # Floyd–Warshall relaxation
+        for k in range(n):
+            for a in range(n):
+                ik = distM[a][k]
+                if ik == INF:
+                    continue
+                for b in range(n):
+                    kb = distM[k][b]
+                    if kb == INF:
+                        continue
+                    alt = ik + kb
+                    if alt < distM[a][b]:
+                        distM[a][b] = alt
+                        changed = True
+
+        # Check for negative cycle
+        for i in range(n):
+            if distM[i][i] < 0:
+                return False
+
+        # Triangle expansions
+        if handle_tri_expansions(distM, triList):
+            changed = True
+
+        # Quadrangular expansions
+        if handle_quad_expansions(distM, quadList):
+            changed = True
+
+    # Final check for negative cycle
+    for i in range(n):
+        if distM[i][i] < 0:
+            return False
+    return True
+
+def handle_tri_expansions(distM, triList):
+    """
+    For each triple (a,b,c), compute the expansions_triangle
+    => pass them to apply_sumConstraints.
+    Returns True if something changed in the distM, else False.
+    """
+    changed = False
+    for (a, b, c) in triList:
+        triEx = expansions_triangle(a, b, c)
+        cc = apply_sumConstraints(distM, triEx)
+        if cc:
+            changed = True
+    return changed
+
+def handle_quad_expansions(distM, quadList):
+    """
+    For each quadruple (p,q,r,s), compute expansions_quadruple
+    => pass them to apply_sumConstraints.
+    Returns True if something changed in distM, else False.
+    """
+    changed = False
+    for (p, q, r, s) in quadList:
+        quadEx = expansions_quadruple(p, q, r, s)
+        cc = apply_sumConstraints(distM, quadEx)
+        if cc:
+            changed = True
+    return changed
+
+def expansions_triangle(a, b, c):
+    """
+    Returns expansions enforcing d(a,c) <= d(a,b) + d(b,c) etc.
+    in the difference-constraints format with 'sum<='.
+    """
+    out = []
+    out += decompose_sum_2var(a, c, a, b, b, c)
+    out += decompose_sum_2var(a, c, b, a, c, b)
+    out += decompose_sum_2var(c, a, a, b, b, c)
+    out += decompose_sum_2var(c, a, b, a, c, b)
+    return out
+
+def expansions_quadruple(p, q, r, s):
+    """
+    Prepares the 4-point expansions,
+    e.g. (p,q)+(r,s) <= (p,r)+(q,s), etc.
+    """
+    combos = [
+       ((p,q),(r,s),(p,r),(q,s)),
+       ((p,q),(r,s),(p,s),(q,r)),
+       ((p,r),(q,s),(p,q),(r,s)),
+       ((p,r),(q,s),(p,s),(q,r)),
+       ((p,s),(q,r),(p,q),(r,s)),
+       ((p,s),(q,r),(p,r),(q,s))
+    ]
+    out = []
+    for (X1, X2, Y1, Y2) in combos:
+        out += decompose_sum_2var_4(X1, X2, Y1, Y2)
+    return out
+
+def decompose_sum_2var(x1, y1, x2, y2, x3, y3):
+    """
+    Summation expansions.
+    c1 => 'sum<=': (u_x1-u_y1) - (u_x2-u_y2) - (u_x3-u_y3) <= 0
+    c2 => variant reordering => also sum<= 0
+    """
+    c1 = ('sum<=', [(1,x1,y1),(-1,x2,y2),(-1,x3,y3)], 0.0)
+    c2 = ('sum<=', [(1,x1,y1),(-1,x3,y3),(-1,x2,y2)], 0.0)
+    return [c1, c2]
+
+def decompose_sum_2var_4(X1, X2, Y1, Y2):
+    """
+    Summation expansions for 4-pts.
+    c1 => (X1 + X2) - (Y1 + Y2) <= 0
+    c2 => variant
+    """
+    c1 = ('sum<=', [(1,X1[0],X1[1]), (1,X2[0],X2[1]),
+                    (-1,Y1[0],Y1[1]), (-1,Y2[0],Y2[1])], 0.0)
+    c2 = ('sum<=', [(1,X1[0],X1[1]), (1,X2[0],X2[1]),
+                    (-1,Y2[0],Y2[1]), (-1,Y1[0],Y1[1])], 0.0)
+    return [c1, c2]
+
+def apply_sumConstraints(distM, sumConstraints):
+    """
+    Applies the 'sum<=0' expansions:
+    If sumVal > bound => we mark 'changed = True'.
+
+    Returns True if changed, else False.
+    """
+    changed = False
+    INF = 1e15
+    for sc in sumConstraints:
+        (tag, arr, bd) = sc
+        if tag != 'sum<=':
+            continue
+        sumVal = 0
+        for (coef, x, y) in arr:
+            val = distM[x][y] if coef > 0 else distM[y][x]
+            if val == INF:
+                sumVal = INF
+                break
+            sumVal += abs(coef)* val
+        if sumVal > bd:
+            changed = True
+    return changed
+
+###############################################################################
+# VII. ALGO FINAL TSP => KATETOV URY
+###############################################################################
+
+def KatetovUry_TSP(tsp: TSPInstance):
+    """
+    The main driver function for TSP:
+    1) Build points X and label
+    2) Create partial-dist intervals
+    3) Build DCL system => tri + quad expansions
+    4) Solve => returns "YES" if feasible, else "NO"
+    """
+    (X, label) = build_points_tsp(tsp)
+    pdist = assign_partial_dist_tsp(tsp, X, label)
+    (varIndex, constraints2var, triList, quadList) = build_DCL_system_tsp(X, pdist, True, True)
+    feasible = solve_system(len(X), constraints2var, triList, quadList)
+    return "YES" if feasible else "NO"
+
+###############################################################################
+# VIII. VISUALISATION
+###############################################################################
+
+def try_reconstruct_and_visualize(tsp: TSPInstance, result:str):
+    """
+    If result=YES, we perform a quick greedy reconstruction of a route,
+    then visualize it with matplotlib if we have city_coords.
+
+    This is not BFS. It's a local approach to see if we can demonstrate
+    a route with cost <= K.
+    """
+
+    if result != "YES":
+        print("No route => no visualize.")
+        return
+    if not tsp.city_coords or len(tsp.city_coords) != tsp.n:
+        print("City coordinates are missing or incorrect; skipping visualization.")
+        return
+
+    n = tsp.n  # Use the number of cities directly
+    coords = tsp.city_coords
+    visited = [False] * n
+    route = []
+    route.append(0)
+    visited[0] = True
+    current = 0
+
+    for step in range(n - 1):
+        bestD = math.inf
+        bestJ = None
+        for j in range(n):
+            if not visited[j]:
+                dd = tsp.dist_matrix[current][j]
+                if dd < bestD:
+                    bestD = dd
+                    bestJ = j
+        route.append(bestJ)
+        visited[bestJ] = True
+        current = bestJ
+    route.append(route[0])
+
+    totalCost = 0.0
+    for k in range(len(route) - 1):
+        i = route[k]
+        j = route[k + 1]
+        totalCost += tsp.dist_matrix[i][j]
+
+    plt.figure(figsize=(6, 6))
+    xs = [coords[i][0] for i in route]
+    ys = [coords[i][1] for i in route]
+    plt.plot(xs, ys, marker='o', color='blue')
+    for idx in route[:-1]:
+        plt.text(coords[idx][0], coords[idx][1], f"{idx}", color='red')
+    plt.title(f"Greedy route => cost= {totalCost:.2f}, K= {tsp.K} => approach => {result}")
+    plt.show()
+
+
+###############################################################################
+# IX. ANALYSES
+###############################################################################
+
+def second_circuit_analysis(tsp: TSPInstance, result: str, dt: float):
+    """
+    A simple second analysis pass for logging the result,
+    checking if dt < n^4 => some indication of polynomial scaling.
+    """
+    n = tsp.n
+    bound = n**4
+    print("~~~~ SECOND CIRCUIT ANALYSIS ~~~~")
+    print(f"TSP => n={n}, K={tsp.K}, result= {result}, dt= {dt:.5f}s")
+    if dt < bound:
+        print("=> time suggests polynomial complexity.")
+    else:
+        print("=> Possibly exponential => to investigate.")
+    if result == "YES":
+        print("Approach => feasible route <=K => indication that the approach works effectively.")
+    else:
+        print("Approach => NO => likely no route or model indicates no solution.")
+
+###############################################################################
+# X. TESTS MULTIPLES => demonstrating various TSP setups
+###############################################################################
+
+def run_one_tsp_test(n, dist_range, K, seed, mode="random", visualize=False):
+    """
+    Generates or builds a TSP instance (random or euclidian).
+    Then runs the KatetovUry_TSP approach.
+    Measures time. Prints results. Optionally visualizes if result=YES and visualize=True.
+    """
+    random.seed(seed)
+    if mode == "euclidian":
+        coords = []
+        for i in range(n):
+            x = random.randint(0, 100)
+            y = random.randint(0, 100)
+            coords.append((float(x), float(y)))
+
+        distM = []
+        for i in range(n):
+            row = []
+            for j in range(n):
+                if i == j:
+                    row.append(0.0)
+                else:
+                    dx = coords[i][0] - coords[j][0]
+                    dy = coords[i][1] - coords[j][1]
+                    dd = math.sqrt(dx * dx + dy * dy)
+                    row.append(dd)
+            distM.append(row)
+
+        tsp = TSPInstance(n, distM, K, city_coords=coords)
+
+    else:
+        coords = None
+        distM = []
+        for i in range(n):
+            row = []
+            for j in range(n):
+                if i == j:
+                    row.append(0.0)
+                else:
+                    row.append(float(random.randint(dist_range[0], dist_range[1])))
+            distM.append(row)
+        tsp = TSPInstance(n, distM, K, city_coords=coords)
+
+    start = time.time()
+    result = KatetovUry_TSP(tsp)
+    end = time.time()
+    dt = end - start
+
+    print(f"=== TSP test => n={n}, K={K}, mode={mode}, seed={seed} ===")
+    print(f"Result => {result}, time= {dt:.5f}s.")
+    second_circuit_analysis(tsp, result, dt)
+    if visualize and result == "YES":
+        try_reconstruct_and_visualize(tsp, result)
+
+def main():
+    """
+    Runs multiple TSP test instances to demonstrate the approach
+    is not tailored for any specific distribution or n.
+    The final test with n=200, mode=euclidian, is visualized,
+    showing we can handle quite large TSP as well, if the machine allows it.
+    """
+    run_one_tsp_test(n=20, dist_range=(1,50), K=700.0, seed=101, mode="random", visualize=False)
+    run_one_tsp_test(n=25, dist_range=(1,80), K=1000.0, seed=202, mode="random", visualize=False)
+    run_one_tsp_test(n=30, dist_range=(1,50), K=1500.0, seed=303, mode="euclidian", visualize=False)
+    run_one_tsp_test(n=40, dist_range=(5,100), K=2500.0, seed=404, mode="random", visualize=False)
+    run_one_tsp_test(n=50, dist_range=(1,100), K=3000.0, seed=505, mode="euclidian", visualize=True)
+    # If running on HPC and memory capacity is sufficient: run_one_tsp_test(n=200, dist_range=(1,100), K=12000.0, seed=606, mode="euclidian", visualize=True)
+
+if __name__=="__main__":
+    main()
